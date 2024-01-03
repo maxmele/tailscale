@@ -49,6 +49,10 @@ spec:
           image: {{ .Values.operatorConfig.image.repo }}{{- if .Values.operatorConfig.image.digest -}}{{ printf "@%s" .Values.operatorConfig.image.digest}}{{- else -}}{{ printf "%s" $operatorTag }}{{- end }}
           imagePullPolicy: {{ .Values.operatorConfig.image.pullPolicy }}
           env:
+            - name: CONTROL_SERVER_URL
+              value: {{ .Values.operatorConfig.controlServerURL }} 
+            - name: OPERATOR_PREAUTH_KEY
+              value: {{ .Values.operatorConfig.preauthKey }}           
             - name: OPERATOR_HOSTNAME
               value: {{ .Values.operatorConfig.hostname }}
             - name: OPERATOR_SECRET

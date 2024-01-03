@@ -56,6 +56,7 @@ func main() {
 	tailscale.I_Acknowledge_This_API_Is_Unstable = true
 
 	var (
+		tsControlURL      = defaultEnv("CONTROL_SERVER_URL", "")
 		tsNamespace       = defaultEnv("OPERATOR_NAMESPACE", "")
 		tslogging         = defaultEnv("OPERATOR_LOGGING", "info")
 		image             = defaultEnv("PROXY_IMAGE", "tailscale/tailscale:latest")
@@ -87,13 +88,25 @@ func main() {
 		hostinfo.SetApp("k8s-operator-proxy")
 	}
 
-	s, tsClient := initTSNet(zlog)
-	defer s.Close()
-	restConfig := config.GetConfigOrDie()
-	maybeLaunchAPIServerProxy(zlog, restConfig, s, mode)
-	// TODO (irbekrm): gather the reconciler options into an opts struct
-	// rather than passing a million of them in one by one.
-	runReconcilers(zlog, s, tsNamespace, restConfig, tsClient, image, priorityClassName, tags, tsFirewallMode, tsEnableConnector)
+	if tsControlURL == "" {
+		s, tsClient := initTSNet(zlog)
+		defer s.Close()
+		restConfig := config.GetConfigOrDie()
+		maybeLaunchAPIServerProxy(zlog, restConfig, s, mode)
+		// TODO (irbekrm): gather the reconciler options into an opts struct
+		// rather than passing a million of them in one by one.
+		runReconcilers(zlog, s, tsNamespace, restConfig, tsClient, image, priorityClassName, tags, tsFirewallMode, tsEnableConnector)
+
+	} else {
+
+		s, tsClient := initHeadscaleNet(zlog, tsControlURL)
+		defer s.Close()
+		restConfig := config.GetConfigOrDie()
+		maybeLaunchAPIServerProxy(zlog, restConfig, s, mode)
+		// TODO (irbekrm): gather the reconciler options into an opts struct
+		// rather than passing a million of them in one by one.
+		runReconcilers(zlog, s, tsNamespace, restConfig, tsClient, image, priorityClassName, tags, tsFirewallMode, tsEnableConnector)
+	}
 }
 
 // initTSNet initializes the tsnet.Server and logs in to Tailscale. It uses the
@@ -176,6 +189,88 @@ waitOnline:
 			if err != nil {
 				startlog.Fatalf("creating operator authkey: %v", err)
 			}
+			if err := lc.Start(ctx, ipn.Options{
+				AuthKey: authkey,
+			}); err != nil {
+				startlog.Fatalf("starting tailscale: %v", err)
+			}
+			if err := lc.StartLoginInteractive(ctx); err != nil {
+				startlog.Fatalf("starting login: %v", err)
+			}
+			startlog.Debugf("requested login by authkey")
+			loginDone = true
+		case "NeedsMachineAuth":
+			if !machineAuthShown {
+				startlog.Infof("Machine approval required, please visit the admin panel to approve")
+				machineAuthShown = true
+			}
+		default:
+			startlog.Debugf("waiting for tailscale to start: %v", st.BackendState)
+		}
+		time.Sleep(time.Second)
+	}
+	return s, tsClient
+}
+
+func initHeadscaleNet(zlog *zap.SugaredLogger, baseURL string) (*tsnet.Server, *tailscale.Client) {
+	var (
+		clientSecret = defaultEnv("OPERATOR_PREAUTH_KEY", "")
+		hostname     = defaultEnv("OPERATOR_HOSTNAME", "tailscale-operator")
+		kubeSecret   = defaultEnv("OPERATOR_SECRET", "")
+	)
+	startlog := zlog.Named("startup")
+
+	credentials := clientcredentials.Config{
+		ClientID:     "some-client-id", // ignored
+		ClientSecret: "some-secret-id", // ignored,
+		TokenURL:     baseURL + "/api/v2/oauth/token",
+		Scopes:       []string{"device"},
+	}
+
+	tsClient := tailscale.NewClient("-", nil)
+	tsClient.HTTPClient = credentials.Client(context.Background())
+	tsClient.BaseURL = baseURL
+
+	s := &tsnet.Server{
+		Hostname:   hostname,
+		Logf:       zlog.Named("tailscaled").Debugf,
+		ControlURL: baseURL,
+	}
+	if kubeSecret != "" {
+		st, err := kubestore.New(logger.Discard, kubeSecret)
+		if err != nil {
+			startlog.Fatalf("creating kube store: %v", err)
+		}
+		s.Store = st
+	}
+	if err := s.Start(); err != nil {
+		startlog.Fatalf("starting tailscale server: %v", err)
+	}
+	lc, err := s.LocalClient()
+	if err != nil {
+		startlog.Fatalf("getting local client: %v", err)
+	}
+
+	ctx := context.Background()
+	loginDone := false
+	machineAuthShown := false
+waitOnline:
+	for {
+		startlog.Debugf("querying tailscaled status")
+		st, err := lc.StatusWithoutPeers(ctx)
+		if err != nil {
+			startlog.Fatalf("getting status: %v", err)
+		}
+		switch st.BackendState {
+		case "Running":
+			break waitOnline
+		case "NeedsLogin":
+			if loginDone {
+				break
+			}
+
+			authkey := clientSecret
+
 			if err := lc.Start(ctx, ipn.Options{
 				AuthKey: authkey,
 			}); err != nil {
