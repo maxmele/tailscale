@@ -23,6 +23,8 @@ operatorConfig:
     digest: ""
     pullPolicy: Always
   logging: "info" # info, debug, dev
+  controlServerURL: https://headscale.example.com
+  preauthKey: xxxxxx
   hostname: "tailscale-operator"
   nodeSelector:
     kubernetes.io/os: linux
