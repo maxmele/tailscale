@@ -57,6 +57,7 @@ func main() {
 
 	var (
 		tsControlURL      = defaultEnv("CONTROL_SERVER_URL", "")
+		preauthKey        = defaultEnv("OPERATOR_PREAUTH_KEY", "")
 		tsNamespace       = defaultEnv("OPERATOR_NAMESPACE", "")
 		tslogging         = defaultEnv("OPERATOR_LOGGING", "info")
 		image             = defaultEnv("PROXY_IMAGE", "tailscale/tailscale:latest")
@@ -95,17 +96,17 @@ func main() {
 		maybeLaunchAPIServerProxy(zlog, restConfig, s, mode)
 		// TODO (irbekrm): gather the reconciler options into an opts struct
 		// rather than passing a million of them in one by one.
-		runReconcilers(zlog, s, tsNamespace, restConfig, tsClient, image, priorityClassName, tags, tsFirewallMode, tsEnableConnector)
+		runReconcilers(zlog, s, tsNamespace, restConfig, tsClient, image, priorityClassName, tags, tsFirewallMode, tsEnableConnector, preauthKey)
 
 	} else {
 
-		s, tsClient := initHeadscaleNet(zlog, tsControlURL)
+		s, tsClient := initHeadscaleNet(zlog, tsControlURL, preauthKey)
 		defer s.Close()
 		restConfig := config.GetConfigOrDie()
 		maybeLaunchAPIServerProxy(zlog, restConfig, s, mode)
 		// TODO (irbekrm): gather the reconciler options into an opts struct
 		// rather than passing a million of them in one by one.
-		runReconcilers(zlog, s, tsNamespace, restConfig, tsClient, image, priorityClassName, tags, tsFirewallMode, tsEnableConnector)
+		runReconcilers(zlog, s, tsNamespace, restConfig, tsClient, image, priorityClassName, tags, tsFirewallMode, tsEnableConnector, preauthKey)
 	}
 }
 
@@ -212,13 +213,16 @@ waitOnline:
 	return s, tsClient
 }
 
-func initHeadscaleNet(zlog *zap.SugaredLogger, baseURL string) (*tsnet.Server, *tailscale.Client) {
+func initHeadscaleNet(zlog *zap.SugaredLogger, baseURL string, preauthKey string) (*tsnet.Server, *tailscale.Client) {
 	var (
-		clientSecret = defaultEnv("OPERATOR_PREAUTH_KEY", "")
-		hostname     = defaultEnv("OPERATOR_HOSTNAME", "tailscale-operator")
-		kubeSecret   = defaultEnv("OPERATOR_SECRET", "")
+		hostname   = defaultEnv("OPERATOR_HOSTNAME", "tailscale-operator")
+		kubeSecret = defaultEnv("OPERATOR_SECRET", "")
 	)
 	startlog := zlog.Named("startup")
+
+	if preauthKey == "" {
+		startlog.Fatalf("If using custom control server OPERATOR_PREAUTH_KEY must be set")
+	}
 
 	credentials := clientcredentials.Config{
 		ClientID:     "some-client-id", // ignored
@@ -269,7 +273,7 @@ waitOnline:
 				break
 			}
 
-			authkey := clientSecret
+			authkey := preauthKey
 
 			if err := lc.Start(ctx, ipn.Options{
 				AuthKey: authkey,
@@ -296,7 +300,7 @@ waitOnline:
 
 // runReconcilers starts the controller-runtime manager and registers the
 // ServiceReconciler. It blocks forever.
-func runReconcilers(zlog *zap.SugaredLogger, s *tsnet.Server, tsNamespace string, restConfig *rest.Config, tsClient *tailscale.Client, image, priorityClassName, tags, tsFirewallMode string, enableConnector bool) {
+func runReconcilers(zlog *zap.SugaredLogger, s *tsnet.Server, tsNamespace string, restConfig *rest.Config, tsClient *tailscale.Client, image, priorityClassName, tags, tsFirewallMode string, enableConnector bool, preauthKey string) {
 	var (
 		isDefaultLoadBalancer = defaultBool("OPERATOR_DEFAULT_LOAD_BALANCER", false)
 	)
@@ -339,6 +343,7 @@ func runReconcilers(zlog *zap.SugaredLogger, s *tsnet.Server, tsNamespace string
 		proxyImage:             image,
 		proxyPriorityClassName: priorityClassName,
 		tsFirewallMode:         tsFirewallMode,
+		preauthKey:             preauthKey,
 	}
 	err = builder.
 		ControllerManagedBy(mgr).

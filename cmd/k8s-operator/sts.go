@@ -93,6 +93,7 @@ type tailscaleSTSReconciler struct {
 	proxyImage             string
 	proxyPriorityClassName string
 	tsFirewallMode         string
+	preauthKey             string
 }
 
 func (sts tailscaleSTSReconciler) validate() error {
@@ -116,11 +117,11 @@ func (a *tailscaleSTSReconciler) Provision(ctx context.Context, logger *zap.Suga
 		return nil, fmt.Errorf("failed to reconcile headless service: %w", err)
 	}
 
-	secretName, err := a.createOrGetSecret(ctx, logger, sts, hsvc)
+	secretName, err := a.createOrGetSecret(ctx, logger, sts, hsvc, a.preauthKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create or get API key secret: %w", err)
 	}
-	_, err = a.reconcileSTS(ctx, logger, sts, hsvc, secretName)
+	_, err = a.reconcileSTS(ctx, logger, sts, hsvc, secretName, a.tsnetServer.ControlURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to reconcile statefulset: %w", err)
 	}
@@ -234,7 +235,7 @@ func (a *tailscaleSTSReconciler) reconcileHeadlessService(ctx context.Context, l
 	return createOrUpdate(ctx, a.Client, a.operatorNamespace, hsvc, func(svc *corev1.Service) { svc.Spec = hsvc.Spec })
 }
 
-func (a *tailscaleSTSReconciler) createOrGetSecret(ctx context.Context, logger *zap.SugaredLogger, stsC *tailscaleSTSConfig, hsvc *corev1.Service) (string, error) {
+func (a *tailscaleSTSReconciler) createOrGetSecret(ctx context.Context, logger *zap.SugaredLogger, stsC *tailscaleSTSConfig, hsvc *corev1.Service, preauthKey string) (string, error) {
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			// Hardcode a -0 suffix so that in future, if we support
@@ -274,7 +275,7 @@ func (a *tailscaleSTSReconciler) createOrGetSecret(ctx context.Context, logger *
 		if len(tags) == 0 {
 			tags = a.defaultTags
 		}
-		authKey, err := a.newAuthKey(ctx, tags)
+		authKey, err := a.newAuthKey(ctx, tags, preauthKey)
 		if err != nil {
 			return "", err
 		}
@@ -329,22 +330,26 @@ func (a *tailscaleSTSReconciler) DeviceInfo(ctx context.Context, childLabels map
 	return id, hostname, ips, nil
 }
 
-func (a *tailscaleSTSReconciler) newAuthKey(ctx context.Context, tags []string) (string, error) {
-	caps := tailscale.KeyCapabilities{
-		Devices: tailscale.KeyDeviceCapabilities{
-			Create: tailscale.KeyDeviceCreateCapabilities{
-				Reusable:      false,
-				Preauthorized: true,
-				Tags:          tags,
+func (a *tailscaleSTSReconciler) newAuthKey(ctx context.Context, tags []string, preauthKey string) (string, error) {
+	if preauthKey == "" {
+		caps := tailscale.KeyCapabilities{
+			Devices: tailscale.KeyDeviceCapabilities{
+				Create: tailscale.KeyDeviceCreateCapabilities{
+					Reusable:      false,
+					Preauthorized: true,
+					Tags:          tags,
+				},
 			},
-		},
-	}
+		}
 
-	key, _, err := a.tsClient.CreateKey(ctx, caps)
-	if err != nil {
-		return "", err
+		key, _, err := a.tsClient.CreateKey(ctx, caps)
+		if err != nil {
+			return "", err
+		}
+		return key, nil
+	} else {
+		return preauthKey, nil
 	}
-	return key, nil
 }
 
 //go:embed deploy/manifests/proxy.yaml
@@ -353,7 +358,7 @@ var proxyYaml []byte
 //go:embed deploy/manifests/userspace-proxy.yaml
 var userspaceProxyYaml []byte
 
-func (a *tailscaleSTSReconciler) reconcileSTS(ctx context.Context, logger *zap.SugaredLogger, sts *tailscaleSTSConfig, headlessSvc *corev1.Service, authKeySecret string) (*appsv1.StatefulSet, error) {
+func (a *tailscaleSTSReconciler) reconcileSTS(ctx context.Context, logger *zap.SugaredLogger, sts *tailscaleSTSConfig, headlessSvc *corev1.Service, authKeySecret string, tsControlURL string) (*appsv1.StatefulSet, error) {
 	var ss appsv1.StatefulSet
 	if sts.ServeConfig != nil {
 		if err := yaml.Unmarshal(userspaceProxyYaml, &ss); err != nil {
@@ -382,6 +387,12 @@ func (a *tailscaleSTSReconciler) reconcileSTS(ctx context.Context, logger *zap.S
 			Name:  "TS_HOSTNAME",
 			Value: sts.Hostname,
 		})
+	if tsControlURL != "" {
+		container.Env = append(container.Env, corev1.EnvVar{
+			Name:  "TS_EXTRA_ARGS",
+			Value: "--login-server=" + tsControlURL,
+		})
+	}
 	if sts.ClusterTargetIP != "" {
 		container.Env = append(container.Env, corev1.EnvVar{
 			Name:  "TS_DEST_IP",
